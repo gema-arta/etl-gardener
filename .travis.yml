@@ -50,7 +50,7 @@ install:
 
 # Install dependencies
 - cd $TRAVIS_BUILD_DIR
-- go get -v -t ./...
+- go get -v -t ./... && go get -v -t ./...  # Run again if it fails
 
 before_script:
 # Try removing boto config, recommended for datastore emulator.
