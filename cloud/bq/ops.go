@@ -4,22 +4,26 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"html/template"
 	"log"
 
 	"cloud.google.com/go/bigquery"
 	"github.com/googleapis/google-cloud-go-testing/bigquery/bqiface"
+	"google.golang.org/api/iterator"
 
 	"github.com/m-lab/go/dataset"
 
 	"github.com/m-lab/etl-gardener/tracker"
 )
 
-// Queryer provides the interface for running bigquery operations.
-type Queryer interface {
-	QueryFor(key string) string
-	Run(ctx context.Context, key string, dryRun bool) (bqiface.Job, error)
-	Copy(ctx context.Context, dryRun bool) (bqiface.Job, error)
+// OpsHandler provides the interface for running bigquery operations.
+type OpsHandler interface {
+	DedupQuery() string
+
+	Dedup(ctx context.Context, dryRun bool) (bqiface.Job, error)
+	CopyToRaw(ctx context.Context, dryRun bool) (bqiface.Job, error)
+	DeleteTmp(ctx context.Context) error
 }
 
 // queryer is used to construct a dedup query.
@@ -29,15 +33,15 @@ type queryer struct {
 	TestTime string // Name of the partition field
 	Job      tracker.Job
 	// map key is the single field name, value is fully qualified name
-	Partition map[string]string
-	Order     string
+	PartitionKeys map[string]string
+	OrderKeys     string
 }
 
 // ErrDatatypeNotSupported is returned by Query for unsupported datatypes.
 var ErrDatatypeNotSupported = errors.New("Datatype not supported")
 
 // NewQuerier creates a suitable QueryParams for a Job.
-func NewQuerier(job tracker.Job, project string) (Queryer, error) {
+func NewQuerier(job tracker.Job, project string) (OpsHandler, error) {
 	c, err := bigquery.NewClient(context.Background(), project)
 	if err != nil {
 		return nil, err
@@ -47,37 +51,47 @@ func NewQuerier(job tracker.Job, project string) (Queryer, error) {
 }
 
 // NewQuerierWithClient creates a suitable QueryParams for a Job.
-func NewQuerierWithClient(client bqiface.Client, job tracker.Job, project string) (Queryer, error) {
+func NewQuerierWithClient(client bqiface.Client, job tracker.Job, project string) (OpsHandler, error) {
 	switch job.Datatype {
 	case "annotation":
 		return &queryer{
-			client:    client,
-			Project:   project,
-			TestTime:  "TestTime",
-			Job:       job,
-			Partition: map[string]string{"UUID": "UUID"},
-			Order:     "",
+			client:        client,
+			Project:       project,
+			TestTime:      "TestTime",
+			Job:           job,
+			PartitionKeys: map[string]string{"UUID": "UUID"},
+			OrderKeys:     "",
+		}, nil
+
+	case "ndt5":
+		return &queryer{
+			client:        client,
+			Project:       project,
+			TestTime:      "log_time",
+			Job:           job,
+			PartitionKeys: map[string]string{"test_id": "test_id"},
+			OrderKeys:     "",
 		}, nil
 
 	case "ndt7":
 		return &queryer{
-			client:    client,
-			Project:   project,
-			TestTime:  "TestTime",
-			Job:       job,
-			Partition: map[string]string{"UUID": "a.UUID"},
-			Order:     "",
+			client:        client,
+			Project:       project,
+			TestTime:      "TestTime",
+			Job:           job,
+			PartitionKeys: map[string]string{"UUID": "a.UUID"},
+			OrderKeys:     "",
 		}, nil
 
 	case "tcpinfo":
 		return &queryer{
-			client:    client,
-			Project:   project,
-			TestTime:  "TestTime",
-			Job:       job,
-			Partition: map[string]string{"uuid": "uuid", "Timestamp": "FinalSnapshot.Timestamp"},
+			client:        client,
+			Project:       project,
+			TestTime:      "TestTime",
+			Job:           job,
+			PartitionKeys: map[string]string{"uuid": "uuid", "Timestamp": "FinalSnapshot.Timestamp"},
 			// TODO TaskFileName should be ArchiveURL once we update the schema.
-			Order: "ARRAY_LENGTH(Snapshots) DESC, ParseInfo.TaskFileName, ",
+			OrderKeys: "ARRAY_LENGTH(Snapshots) DESC, ParseInfo.TaskFileName, ",
 		}, nil
 	default:
 		return nil, ErrDatatypeNotSupported
@@ -85,8 +99,7 @@ func NewQuerierWithClient(client bqiface.Client, job tracker.Job, project string
 }
 
 var queryTemplates = map[string]*template.Template{
-	"dedup":   dedupTemplate,
-	"cleanup": cleanupTemplate,
+	"dedup": dedupTemplate,
 }
 
 // MakeQuery creates a query from a template.
@@ -99,18 +112,14 @@ func (params queryer) makeQuery(t *template.Template) string {
 	return out.String()
 }
 
-// QueryFor returns the appropriate query in string form.
-func (params queryer) QueryFor(key string) string {
-	t, ok := queryTemplates[key]
-	if !ok {
-		return ""
-	}
-	return params.makeQuery(t)
+// DedupQuery returns the appropriate query in string form.
+func (params queryer) DedupQuery() string {
+	return params.makeQuery(dedupTemplate)
 }
 
 // Run executes a query constructed from a template.  It returns the bqiface.Job.
-func (params queryer) Run(ctx context.Context, key string, dryRun bool) (bqiface.Job, error) {
-	qs := params.QueryFor(key)
+func (params queryer) Dedup(ctx context.Context, dryRun bool) (bqiface.Job, error) {
+	qs := params.DedupQuery()
 	if len(qs) == 0 {
 		return nil, dataset.ErrNilQuery
 	}
@@ -128,32 +137,51 @@ func (params queryer) Run(ctx context.Context, key string, dryRun bool) (bqiface
 	return q.Run(ctx)
 }
 
-// Copy copies the tmp_ job partition to the raw_ job partition.
-func (params queryer) Copy(ctx context.Context, dryRun bool) (bqiface.Job, error) {
+// CopyToRaw copies the tmp_ job partition to the raw_ job partition.
+func (params queryer) CopyToRaw(ctx context.Context, dryRun bool) (bqiface.Job, error) {
+	if dryRun {
+		return nil, errors.New("dryrun not implemented")
+	}
 	if params.client == nil {
 		return nil, dataset.ErrNilBqClient
 	}
-	src := params.client.Dataset("tmp_" + params.Job.Experiment).Table(params.Job.Datatype)
-	dest := params.client.Dataset("raw_" + params.Job.Experiment).Table(params.Job.Datatype)
+	client, err := bigquery.NewClient(ctx, params.client.Dataset("tmp_"+params.Job.Experiment).ProjectID())
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO - names should be fields in queryer.
+	src := client.Dataset("tmp_" + params.Job.Experiment).
+		Table(params.Job.Datatype + "$" + params.Job.Date.Format("20060102"))
+	dest := client.Dataset("raw_" + params.Job.Experiment).
+		Table(params.Job.Datatype + "$" + params.Job.Date.Format("20060102"))
+
+	if m, err := src.Metadata(ctx); err == nil {
+		log.Printf("%+v\n", m)
+	}
+	if m, err := dest.Metadata(ctx); err == nil {
+		log.Printf("%+v\n", m)
+	}
 
 	copier := dest.CopierFrom(src)
-	config := bqiface.CopyConfig{}
-	config.WriteDisposition = bigquery.WriteTruncate
-	config.Dst = dest
-	config.Srcs = append(config.Srcs, src)
-	copier.SetCopyConfig(config)
-	return copier.Run(ctx)
+	copier.CopyConfig.WriteDisposition = bigquery.WriteTruncate
+	//log.Printf("%+v\n%+v\n%+v\n", config.Srcs[0], config.Dst, *(*bqiface.Copier)(copier))
+
+	j, err := copier.Run(ctx)
+
+	return &xJob{j: j}, err
 }
 
-// Dedup executes a query that deletes duplicates from the destination table.
-func (params queryer) Dedup(ctx context.Context, dryRun bool) (bqiface.Job, error) {
-	return params.Run(ctx, "dedup", dryRun)
-}
-
-// Cleanup executes a query that deletes the entire partition
-// from the tmp table.
-func (params queryer) Cleanup(ctx context.Context, dryRun bool) (bqiface.Job, error) {
-	return params.Run(ctx, "cleanup", dryRun)
+// DeleteTmp deletes the tmp table partition.
+func (params queryer) DeleteTmp(ctx context.Context) error {
+	if params.client == nil {
+		return dataset.ErrNilBqClient
+	}
+	// TODO - name should be field in queryer.
+	tmp := params.client.Dataset("tmp_" + params.Job.Experiment).Table(
+		fmt.Sprintf("%s$%s", params.Job.Datatype, params.Job.Date.Format("20060102")))
+	log.Println("Deleting", tmp.FullyQualifiedName())
+	return tmp.Delete(ctx)
 }
 
 // TODO get the tmp_ and raw_ from the job Target?
@@ -175,11 +203,11 @@ AND NOT EXISTS (
   WITH keep AS (
   SELECT * EXCEPT(row_number) FROM (
     SELECT
-      {{range $k, $v := .Partition}}{{$v}}, {{end}}
+      {{range $k, $v := .PartitionKeys}}{{$v}}, {{end}}
 	  ParseInfo.ParseTime,
       ROW_NUMBER() OVER (
-        PARTITION BY {{range $k, $v := .Partition}}{{$v}}, {{end}}ParseInfo.ParseTime
-        ORDER BY {{.Order}} ParseInfo.ParseTime DESC
+        PARTITION BY {{range $k, $v := .PartitionKeys}}{{$v}}, {{end}}ParseInfo.ParseTime
+        ORDER BY {{.OrderKeys}} ParseInfo.ParseTime DESC
       ) row_number
       FROM (
         SELECT * FROM ` + tmpTable + `
@@ -192,14 +220,80 @@ AND NOT EXISTS (
   # This matches against the keep table based on keys.  Sufficient select keys must be
   # used to distinguish the preferred row from the others.
   WHERE
-    {{range $k, $v := .Partition}}target.{{$v}} = keep.{{$k}} AND {{end}}
+    {{range $k, $v := .PartitionKeys}}target.{{$v}} = keep.{{$k}} AND {{end}}
     target.ParseInfo.ParseTime = keep.ParseTime
 )`))
 
-var cleanupTemplate = template.Must(template.New("").Parse(`
+// Template for restoring any missing rows from raw_ndt to tmp_ndt
+// Needs unique rowID.  This will eventually be "id"
+var restoreTemplate = template.Must(template.New("").Parse(`
 #standardSQL
-# Delete all rows in a partition.
-DELETE
-FROM ` + tmpTable + `
+# Restore any rows in raw_ndt missing from tmp_ndt
+#standardSQL
+INSERT INTO ` + tmpTable + `
+
+SELECT *
+FROM ` + rawTable + `
 WHERE Date({{.TestTime}}) = "{{.Job.Date.Format "2006-01-02"}}"
-`))
+AND test_id NOT IN (
+  SELECT test_id  
+  FROM ` + tmpTable + `
+  WHERE Date({{.TestTime}}) = "{{.Job.Date.Format "2006-01-02"}}"
+)`))
+
+// This is used to allow using bigquery.Copier as a bqiface.Copier.  YUCK.
+type xRowIterator struct {
+	i *bigquery.RowIterator
+	bqiface.RowIterator
+}
+
+func (i *xRowIterator) SetStartIndex(s uint64) {
+	i.i.StartIndex = s
+}
+func (i *xRowIterator) Schema() bigquery.Schema {
+	return i.i.Schema
+}
+func (i *xRowIterator) TotalRows() uint64 {
+	return i.i.TotalRows
+}
+func (i *xRowIterator) Next(p interface{}) error {
+	return i.i.Next(p)
+}
+func (i *xRowIterator) PageInfo() *iterator.PageInfo {
+	return i.i.PageInfo()
+}
+
+func assertRowIterator() {
+	func(bqiface.RowIterator) {}(&xRowIterator{})
+}
+
+type xJob struct {
+	j *bigquery.Job
+	bqiface.Job
+}
+
+func (x *xJob) ID() string {
+	return x.j.ID()
+}
+func (x *xJob) Location() string {
+	return x.j.Location()
+}
+func (x *xJob) Config() (bigquery.JobConfig, error) {
+	return x.j.Config()
+}
+func (x *xJob) Status(ctx context.Context) (*bigquery.JobStatus, error) {
+	return x.j.Status(ctx)
+}
+func (x *xJob) LastStatus() *bigquery.JobStatus {
+	return x.j.LastStatus()
+}
+func (x *xJob) Cancel(ctx context.Context) error {
+	return x.j.Cancel(ctx)
+}
+func (x *xJob) Wait(ctx context.Context) (*bigquery.JobStatus, error) {
+	return x.j.Wait(ctx)
+}
+func (x *xJob) Read(ctx context.Context) (bqiface.RowIterator, error) {
+	i, err := x.j.Read(ctx)
+	return &xRowIterator{i: i}, err
+}
